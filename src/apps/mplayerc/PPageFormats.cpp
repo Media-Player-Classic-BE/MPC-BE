@@ -1,0 +1,1497 @@
+/*
+ * (C) 2003-2006 Gabest
+ * (C) 2006-2026 see Authors.txt
+ *
+ * This file is part of MPC-BE.
+ *
+ * MPC-BE is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation; either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * MPC-BE is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ */
+
+#include "stdafx.h"
+#include "Misc.h"
+#include "DSUtil/FileHandle.h"
+#include "DSUtil/SysVersion.h"
+#include <HighDPI.h>
+#include "PPageFormats.h"
+#include "SvgHelper.h"
+#include "WindowsUserChoice.h"
+#include "controls/DarkTheme.h"
+#include <uxtheme.h>
+#include <vssym32.h> // BP_CHECKBOX / CBS_*
+#pragma comment(lib, "uxtheme.lib")
+
+static constexpr auto previousRegistration = L"PreviousRegistration";
+static constexpr auto registeredAppName    = L"MPC-BE";
+static constexpr auto registeredKey        = L"Software\\Clients\\Media\\MPC-BE\\Capabilities";
+
+// Renders the native themed dark checkbox — the same celeste-accent glyph the rest of
+// the dark Options dialog uses (Internal Filters, Fullscreen) — into a 3-state image
+// list: index 0 = unchecked, 1 = checked, 2 = indeterminate.
+// The glyph is drawn directly over the opaque dark row background (exactly like the
+// Fullscreen page draws it with DrawThemeBackground). Going through buffered paint /
+// premultiplied alpha instead darkened the celeste and left the unchecked box white.
+// Because the app runs in force-dark mode, OpenThemeData(..., "BUTTON") resolves to the
+// dark (celeste) checkbox.
+static bool MakeThemedCheckImageList(CImageList& il, int h, HWND hRef, bool bDark)
+{
+	if (bDark) {
+		DarkTheme::AllowDarkModeForApp();     // force-dark app mode
+		DarkTheme::ApplyThemeToControl(hRef); // allow dark mode on the list *now* — this runs at
+		                                      // OnInitDialog time, before the page's OnSetActive
+		                                      // themes it, so OpenThemeData(hRef, "BUTTON") resolves
+		                                      // to the dark checkbox (celeste check), not the light one.
+	}
+	// In light mode the control keeps its default theme, so OpenThemeData resolves to the native
+	// light checkbox glyph — the same one the other checklists show when the dark theme is off.
+
+	HTHEME hTheme = ::OpenThemeData(hRef, L"BUTTON");
+	if (!hTheme) {
+		return false;
+	}
+
+	il.DeleteImageList();
+	if (!il.Create(h, h, ILC_COLOR32, 3, 0)) {
+		::CloseThemeData(hTheme);
+		return false;
+	}
+
+	// Buffered painting into a 32-bit top-down DIB keeps the glyph's per-pixel alpha, so
+	// the rounded corners stay transparent (a plain opaque draw left 4 white corner dots).
+	::BufferedPaintInit();
+
+	const int states[3] = { CBS_UNCHECKEDNORMAL, CBS_CHECKEDNORMAL, CBS_MIXEDNORMAL };
+	HDC hdcScreen = ::GetDC(nullptr);
+	HDC hdcMem    = ::CreateCompatibleDC(hdcScreen);
+	bool ok = true;
+
+	for (int i = 0; i < 3 && ok; ++i) {
+		BITMAPINFO bmi = {};
+		bmi.bmiHeader.biSize        = sizeof(BITMAPINFOHEADER);
+		bmi.bmiHeader.biWidth       = h;
+		bmi.bmiHeader.biHeight      = -h; // top-down
+		bmi.bmiHeader.biPlanes      = 1;
+		bmi.bmiHeader.biBitCount    = 32;
+		bmi.bmiHeader.biCompression = BI_RGB;
+
+		void* pBits = nullptr;
+		HBITMAP hDib = ::CreateDIBSection(hdcScreen, &bmi, DIB_RGB_COLORS, &pBits, nullptr, 0);
+		if (!hDib) {
+			ok = false;
+			break;
+		}
+		HBITMAP hOldBmp = (HBITMAP)::SelectObject(hdcMem, hDib);
+
+		RECT rcFull = { 0, 0, h, h };
+		BP_PAINTPARAMS pp = { sizeof(pp) };
+		pp.dwFlags = BPPF_ERASE;
+		HDC hdcPaint = nullptr;
+		HPAINTBUFFER hbp = ::BeginBufferedPaint(hdcMem, &rcFull, BPBF_TOPDOWNDIB, &pp, &hdcPaint);
+		if (hbp) {
+			SIZE gsz = { h, h };
+			::GetThemePartSize(hTheme, hdcPaint, BP_CHECKBOX, states[i], nullptr, TS_DRAW, &gsz);
+			// Clamp to the cell so the glyph is never clipped (its natural size can be a
+			// couple of pixels larger than the cell, which cut off part of the checkbox).
+			int sz = std::min(std::min((int)gsz.cx, (int)gsz.cy), h);
+			if (sz < 1) { sz = h; }
+			RECT rg;
+			rg.left   = (h - sz) / 2;
+			rg.top    = (h - sz) / 2;
+			rg.right  = rg.left + sz;
+			rg.bottom = rg.top  + sz;
+			::DrawThemeBackground(hTheme, hdcPaint, BP_CHECKBOX, states[i], &rg, nullptr);
+			::EndBufferedPaint(hbp, TRUE); // copy the premultiplied bits into hDib
+		} else {
+			ok = false;
+		}
+
+		::SelectObject(hdcMem, hOldBmp);
+		if (ok) {
+			il.Add(CBitmap::FromHandle(hDib), (CBitmap*)nullptr); // 32bpp: keeps per-pixel alpha
+		}
+		::DeleteObject(hDib);
+	}
+
+	::DeleteDC(hdcMem);
+	::ReleaseDC(nullptr, hdcScreen);
+	::BufferedPaintUnInit();
+	::CloseThemeData(hTheme);
+
+	if (ok && il.GetImageCount() == 3) {
+		return true;
+	}
+	il.DeleteImageList();
+	return false;
+}
+
+// Fallback (used only if the themed glyph above is unavailable): a hand-drawn dark box
+// with a celeste checkmark, matching the palette of the rest of the dark dialog.
+static void MakeDarkCheckImageList(CImageList& il, int h, HWND hRef)
+{
+	if (MakeThemedCheckImageList(il, h, hRef, true)) {
+		return;
+	}
+
+	const COLORREF mask   = RGB(255, 0, 255);   // transparent key colour
+	const COLORREF back   = DarkTheme::CtrlBackColor();
+	const COLORREF border = DarkTheme::CtrlBorderColor();
+	const COLORREF mark   = RGB(76, 194, 255);  // celeste, Win11 dark-mode accent glyph
+
+	CClientDC screen(nullptr);
+	CDC dc;
+	dc.CreateCompatibleDC(&screen);
+	CBitmap bmp;
+	bmp.CreateCompatibleBitmap(&screen, h * 3, h);
+	CBitmap* pOld = dc.SelectObject(&bmp);
+
+	dc.FillSolidRect(0, 0, h * 3, h, mask);
+
+	for (int i = 0; i < 3; ++i) {
+		CRect box(i * h, 0, i * h + h, h);
+		box.DeflateRect(1, 1);
+		dc.FillSolidRect(box, back);
+		dc.Draw3dRect(box, border, border);
+
+		if (i == 1) {
+			// checkmark
+			CPen pen(PS_SOLID, 2, mark);
+			CPen* pp = dc.SelectObject(&pen);
+			const int l = box.left, t = box.top, w = box.Width(), hh = box.Height();
+			dc.MoveTo(l + w * 3 / 10,  t + hh * 5 / 10);
+			dc.LineTo(l + w * 45 / 100, t + hh * 7 / 10);
+			dc.LineTo(l + w * 75 / 100, t + hh * 28 / 100);
+			dc.SelectObject(pp);
+		} else if (i == 2) {
+			// partial: a small filled square
+			CRect inner = box;
+			inner.DeflateRect(box.Width() / 4, box.Height() / 4);
+			dc.FillSolidRect(inner, mark);
+		}
+	}
+
+	dc.SelectObject(pOld);
+	il.DeleteImageList();
+	il.Create(h, h, ILC_COLOR24 | ILC_MASK, 3, 0);
+	il.Add(&bmp, mask);
+}
+
+// CPPageFormats dialog
+
+CComPtr<IApplicationAssociationRegistration> CPPageFormats::m_pAAR;
+
+// TODO: change this along with the root key for settings and the mutex name to
+//       avoid possible risks of conflict with the old MPC (non BE version).
+#ifdef _WIN64
+	#define PROGID L"mpc-be64"
+#else
+	#define PROGID L"mpc-be"
+#endif // _WIN64
+
+IMPLEMENT_DYNAMIC(CPPageFormats, CPPageBase)
+CPPageFormats::CPPageFormats()
+	: CPPageBase(CPPageFormats::IDD, CPPageFormats::IDD)
+	, m_list(0)
+	, m_bInsufficientPrivileges(false)
+	, m_bFileExtChanged(false)
+{
+	if (!m_pAAR && !SysVersion::IsWin10orLater()) {
+		// Default manager (requires at least Vista)
+		HRESULT hr = CoCreateInstance(CLSID_ApplicationAssociationRegistration,
+									  nullptr,
+									  CLSCTX_INPROC,
+									  IID_PPV_ARGS(&m_pAAR));
+		UNREFERENCED_PARAMETER(hr);
+	}
+}
+
+void CPPageFormats::DoDataExchange(CDataExchange* pDX)
+{
+	__super::DoDataExchange(pDX);
+	DDX_Control(pDX, IDC_LIST1, m_list);
+	DDX_Text(pDX, IDC_EDIT1, m_exts);
+	DDX_Control(pDX, IDC_STATIC1, m_autoplay);
+	DDX_Control(pDX, IDC_CHECK1, m_apvideo);
+	DDX_Control(pDX, IDC_CHECK2, m_apmusic);
+	DDX_Control(pDX, IDC_CHECK3, m_apaudiocd);
+	DDX_Control(pDX, IDC_CHECK4, m_apdvd);
+	DDX_Control(pDX, IDC_CHECK6, m_chContextDir);
+	DDX_Control(pDX, IDC_CHECK7, m_chContextFiles);
+	DDX_Control(pDX, IDC_CHECK8, m_chAssociatedWithIcons);
+}
+
+int CPPageFormats::GetChecked(int iItem)
+{
+	// The check state lives in the item's state-image index (1-based). Using the state image
+	// instead of the small icon keeps the checkbox out of the row's selection highlight, like a
+	// native list-view checkbox (the small icon shares the item cell and gets the highlight).
+	const UINT st = m_list.GetItemState(iItem, LVIS_STATEIMAGEMASK);
+	return (int)(st >> 12) - 1; // 0 = none, 1 = all, 2 = partial
+}
+
+void CPPageFormats::SetChecked(int iItem, int iChecked)
+{
+	m_list.SetItemState(iItem, INDEXTOSTATEIMAGEMASK(iChecked + 1), LVIS_STATEIMAGEMASK);
+}
+
+CString CPPageFormats::GetEnqueueCommand()
+{
+	return L"\"" + GetProgramPath() + L"\" /add \"%1\"";
+}
+
+CString CPPageFormats::GetOpenCommand()
+{
+	return L"\"" + GetProgramPath() + L"\" \"%1\"";
+}
+
+bool CPPageFormats::IsRegistered(CString ext, bool bCheckProgId/* = false*/)
+{
+	BOOL    bIsDefault = FALSE;
+	CString strProgID  = PROGID + ext;
+
+	if (m_pAAR) {
+		// The Vista/7/8 way
+		m_pAAR->QueryAppIsDefault(ext, AT_FILEEXTENSION, AL_EFFECTIVE, registeredAppName, &bIsDefault);
+	} else {
+		// The 2000/XP/10 way
+		CRegKey key;
+		WCHAR   buff[MAX_PATH] = {};
+		ULONG   len = std::size(buff);
+
+		if (ERROR_SUCCESS != key.Open(HKEY_CLASSES_ROOT, ext, KEY_READ)) {
+			return false;
+		}
+
+		if (ERROR_SUCCESS != key.QueryStringValue(nullptr, buff, &len) && !CString(buff).Trim().IsEmpty()) {
+			return false;
+		}
+
+		bIsDefault = (buff == strProgID);
+	}
+
+	// Check if association is for this instance of MPC
+	if (bIsDefault) {
+		CRegKey key;
+		WCHAR   buff[MAX_PATH] = {};
+		ULONG   len = std::size(buff);
+
+		bIsDefault = FALSE;
+		if (ERROR_SUCCESS == key.Open(HKEY_CLASSES_ROOT, strProgID + L"\\shell\\open\\command", KEY_READ)) {
+			CString strCommand = GetOpenCommand();
+			if (ERROR_SUCCESS == key.QueryStringValue(nullptr, buff, &len)) {
+				bIsDefault = (strCommand.CompareNoCase(CString(buff)) == 0);
+			}
+		}
+	}
+
+	if (bIsDefault && SysVersion::IsWin10orLater() && bCheckProgId) {
+		CRegKey key;
+		WCHAR   buff[MAX_PATH] = {};
+		ULONG   len = std::size(buff);
+
+		if (ERROR_SUCCESS == key.Open(HKEY_CURRENT_USER, CString(L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Explorer\\FileExts\\" + ext + L"\\UserChoice"), KEY_READ)) {
+			if (ERROR_SUCCESS == key.QueryStringValue(L"ProgId", buff, &len)) {
+				bIsDefault = (strProgID.CompareNoCase(CString(buff)) == 0);
+			}
+		}
+	}
+
+	return !!bIsDefault;
+}
+
+typedef int (*GetIconIndexFunc)(LPCWSTR);
+static int GetIconIndex(LPCWSTR ext)
+{
+	int iconindex = -1;
+
+	static HMODULE mpciconlib = LoadLibraryW(L"mpciconlib.dll");
+	if (mpciconlib) {
+		static GetIconIndexFunc pGetIconIndexFunc = (GetIconIndexFunc)GetProcAddress(mpciconlib, "get_icon_index");
+		if (pGetIconIndexFunc) {
+			iconindex = pGetIconIndexFunc(ext);
+		}
+	}
+
+	return iconindex;
+}
+
+bool CPPageFormats::RegisterApp()
+{
+	CString AppIcon;
+
+	AppIcon = GetProgramPath();
+	AppIcon = "\""+AppIcon+"\"";
+	AppIcon += L",0";
+
+	// Register MPC for the windows "Default application" manager
+	CRegKey key;
+
+	if (ERROR_SUCCESS == key.Open(HKEY_LOCAL_MACHINE, L"SOFTWARE\\RegisteredApplications")) {
+		key.SetStringValue(L"MPC-BE", registeredKey);
+
+		if (ERROR_SUCCESS != key.Create(HKEY_LOCAL_MACHINE, registeredKey)) {
+			return false;
+		}
+
+		// ==>>  TODO icon !!!
+		key.SetStringValue(L"ApplicationDescription", ResStr(IDS_APP_DESCRIPTION), REG_EXPAND_SZ);
+		key.SetStringValue(L"ApplicationIcon", AppIcon, REG_EXPAND_SZ);
+		key.SetStringValue(L"ApplicationName", ResStr(IDR_MAINFRAME), REG_EXPAND_SZ);
+	}
+
+	return true;
+}
+
+bool CPPageFormats::RegisterExt(CString ext, CString strLabel, filetype_t filetype, bool SetContextFiles/* = false*/, bool setAssociatedWithIcon/* = true*/)
+{
+	CRegKey key;
+	CString strProgID = PROGID + ext;
+
+	bool bSetValue = true || (ERROR_SUCCESS != key.Open(HKEY_CLASSES_ROOT, strProgID + L"\\shell\\open\\command", KEY_READ));
+	// Why bSetValue?
+
+	// Create ProgID for this file type
+	if (ERROR_SUCCESS != key.Create(HKEY_CLASSES_ROOT, strProgID)) {
+		return false;
+	}
+	if (ERROR_SUCCESS != key.SetStringValue(nullptr, strLabel)) {
+		return false;
+	}
+
+	// Add to playlist option
+	if (SetContextFiles && !ShellExtExists()) {
+		if (ERROR_SUCCESS != key.Create(HKEY_CLASSES_ROOT, strProgID + L"\\shell\\enqueue")) {
+			return false;
+		}
+		if (ERROR_SUCCESS != key.SetStringValue(nullptr, ResStr(IDS_ADD_TO_PLAYLIST))) {
+			return false;
+		}
+		if (ERROR_SUCCESS != key.SetStringValue(L"Icon", L"\"" + GetProgramPath() + L"\",0")) {
+			return false;
+		}
+
+		if (ERROR_SUCCESS != key.Create(HKEY_CLASSES_ROOT, strProgID + L"\\shell\\enqueue\\command")) {
+			return false;
+		}
+		if (bSetValue && (ERROR_SUCCESS != key.SetStringValue(nullptr, GetEnqueueCommand()))) {
+			return false;
+		}
+	} else {
+		key.Close();
+		key.Attach(HKEY_CLASSES_ROOT);
+		key.RecurseDeleteKey(strProgID + L"\\shell\\enqueue");
+	}
+
+	// Play option
+	if (ERROR_SUCCESS != key.Create(HKEY_CLASSES_ROOT, strProgID + L"\\shell\\open")) {
+		return false;
+	}
+	if (SetContextFiles && !ShellExtExists()) {
+		if (ERROR_SUCCESS != key.SetStringValue(nullptr, ResStr(IDS_OPEN_WITH_MPC))) {
+			return false;
+		}
+		if (ERROR_SUCCESS != key.SetStringValue(L"Icon", L"\"" + GetProgramPath() + L"\",0")) {
+			return false;
+		}
+	} else {
+		if (ERROR_SUCCESS != key.SetStringValue(nullptr, L"")) {
+			return false;
+		}
+	}
+
+	if (ERROR_SUCCESS != key.Create(HKEY_CLASSES_ROOT, strProgID + L"\\shell\\open\\command")) {
+		return false;
+	}
+	if (bSetValue && (ERROR_SUCCESS != key.SetStringValue(nullptr, GetOpenCommand()))) {
+		return false;
+	}
+
+	if (ERROR_SUCCESS != key.Create(HKEY_LOCAL_MACHINE, CString(registeredKey) + L"\\FileAssociations")) {
+		return false;
+	}
+	if (ERROR_SUCCESS != key.SetStringValue(ext, strProgID)) {
+		return false;
+	}
+
+	if (setAssociatedWithIcon) {
+		CString AppIcon;
+
+		// first look for the icon
+		CString ext_icon = GetProgramDir();
+		ext_icon.AppendFormat(L"icons\\%s.ico", CString(ext).TrimLeft('.'));
+		if (::PathFileExistsW(ext_icon)) {
+			AppIcon.Format(L"\"%s\",0", ext_icon);
+		} else {
+			// then look for the iconlib
+			CString mpciconlib = GetProgramDir() + L"mpciconlib.dll";
+			if (::PathFileExistsW(mpciconlib)) {
+				int icon_index = GetIconIndex(ext);
+				if (icon_index < 0) {
+					if (filetype == TAudio) {
+						icon_index = GetIconIndex(L":audio");
+					} else if (filetype == TPlaylist) {
+						icon_index = GetIconIndex(L":playlist");
+					}
+
+					if (icon_index < 0) {
+						icon_index = GetIconIndex(L":video");
+					}
+				}
+				if (icon_index >= 0 && ExtractIconW(AfxGetApp()->m_hInstance,(LPCWSTR)mpciconlib, icon_index)) {
+					AppIcon.Format(L"\"%s\",%d", mpciconlib, icon_index);
+				}
+			}
+		}
+
+		/* no icon was found for the file extension, so use MPC's icon */
+		if ((AppIcon.IsEmpty())) {
+			AppIcon = GetProgramPath();
+			AppIcon = "\""+AppIcon+"\"";
+			AppIcon += L",0";
+		}
+
+		if (ERROR_SUCCESS != key.Create(HKEY_CLASSES_ROOT, strProgID + L"\\DefaultIcon")) {
+			return false;
+		}
+		if (bSetValue && (ERROR_SUCCESS != key.SetStringValue(nullptr, AppIcon))) {
+			return false;
+		}
+	} else {
+		key.Close();
+		key.Attach(HKEY_CLASSES_ROOT);
+		key.RecurseDeleteKey(strProgID + L"\\DefaultIcon");
+	}
+
+	if (!IsRegistered(ext, true)) {
+		SetFileAssociation(ext, strProgID, true);
+	}
+
+	return true;
+}
+
+bool CPPageFormats::UnRegisterExt(CString ext)
+{
+	CRegKey key;
+	CString strProgID = PROGID + ext;
+
+	if (IsRegistered(ext)) {
+		SetFileAssociation(ext, strProgID, false);
+	}
+
+	key.Attach(HKEY_CLASSES_ROOT);
+	key.RecurseDeleteKey(strProgID);
+	key.Close();
+
+	if (ERROR_SUCCESS == key.Open(HKEY_LOCAL_MACHINE, CString(registeredKey) + L"\\FileAssociations")) {
+		key.DeleteValue(ext);
+	}
+
+	return true;
+}
+
+HRESULT CPPageFormats::RegisterUI()
+{
+	int nRegisteredExtCount = 0;
+	for (const auto& mfc : AfxGetAppSettings().m_Formats) {
+		int j = 0;
+		const CString str = mfc.GetExtsWithPeriod();
+		for (CString ext = str.Tokenize(L" ", j); !ext.IsEmpty(); ext = str.Tokenize(L" ", j)) {
+			if (IsRegistered(ext)) {
+				nRegisteredExtCount++;
+			}
+		}
+	}
+
+	if (nRegisteredExtCount == 0) {
+		return S_FALSE;
+	}
+
+	HRESULT hr = E_FAIL;
+
+	if (SysVersion::IsWin10orLater()) {
+		IOpenControlPanel* pCP = nullptr;
+		hr = CoCreateInstance(CLSID_OpenControlPanel,
+							  nullptr,
+							  CLSCTX_INPROC,
+							  IID_PPV_ARGS(&pCP));
+
+		if (SUCCEEDED(hr) && pCP) {
+			hr = pCP->Open(L"Microsoft.DefaultPrograms", L"pageDefaultProgram", nullptr);
+			pCP->Release();
+		}
+	} else if (SysVersion::IsWin8orLater()) {
+		IApplicationAssociationRegistrationUI* pUI = nullptr;
+		hr = CoCreateInstance(CLSID_ApplicationAssociationRegistrationUI,
+							  nullptr,
+							  CLSCTX_INPROC,
+							  IID_PPV_ARGS(&pUI));
+
+		if (SUCCEEDED(hr) && pUI) {
+			hr = pUI->LaunchAdvancedAssociationUI(registeredAppName);
+			pUI->Release();
+		}
+	}
+
+	return hr;
+}
+
+static CStringW SystemPath()
+{
+	auto GetSystemPath = [] {
+		CString ret;
+
+		PWSTR pathSystem = nullptr;
+		HRESULT hr = SHGetKnownFolderPath(FOLDERID_System, 0, nullptr, &pathSystem);
+		if (SUCCEEDED(hr)) {
+			ret.Format(L"%s\\", pathSystem);
+		}
+		CoTaskMemFree(pathSystem);
+
+		return ret;
+	};
+
+	static auto path = GetSystemPath();
+	return path;
+}
+
+static void Execute(CStringW commandLine)
+{
+	STARTUPINFOW startup_info = {};
+	startup_info.cb = sizeof(STARTUPINFO);
+	startup_info.wShowWindow = SW_HIDE;
+	PROCESS_INFORMATION proc_info = {};
+
+	if (CreateProcessW(nullptr, commandLine.GetBuffer(), nullptr, nullptr, FALSE,
+					   0, nullptr, nullptr, &startup_info, &proc_info)) {
+		WaitForSingleObject(proc_info.hProcess, INFINITE);
+
+		CloseHandle(proc_info.hProcess);
+		CloseHandle(proc_info.hThread);
+	}
+}
+
+typedef HRESULT (WINAPI *tpDllRegisterServer)();
+typedef HRESULT (WINAPI *tpDllUnRegisterServer)();
+bool CPPageFormats::RegisterShellExt(LPCWSTR lpszLibrary)
+{
+	if (!::PathFileExistsW(lpszLibrary)) {
+		return false;
+	}
+
+	CRegKey key;
+	if (ERROR_SUCCESS == key.Create(HKEY_CURRENT_USER, shellExtKeyName)) {
+		key.SetStringValue(L"MpcPath", GetProgramPath());
+		key.Close();
+	}
+	if (ERROR_SUCCESS == key.Create(HKEY_LOCAL_MACHINE, shellExtKeyName)) {
+		key.SetStringValue(L"MpcPath", GetProgramPath());
+		key.Close();
+	}
+
+	HINSTANCE hDLL = LoadLibraryW(lpszLibrary);
+	if (hDLL == nullptr) {
+		if (::PathFileExistsW(lpszLibrary)) {
+			CString strParameters;
+			strParameters.Format(L" /s \"%s\"", lpszLibrary);
+			Execute(SystemPath() + L"regsvr32.exe" + strParameters);
+
+			return true;
+		}
+		return false;
+	}
+
+	auto pDllRegisterServer = (tpDllRegisterServer)GetProcAddress(hDLL, "DllRegisterServer");
+	if (pDllRegisterServer == nullptr) {
+		FreeLibrary(hDLL);
+		return false;
+	}
+
+	HRESULT hr = pDllRegisterServer();
+
+	FreeLibrary(hDLL);
+
+	return SUCCEEDED(hr);
+}
+
+bool CPPageFormats::UnRegisterShellExt(LPCWSTR lpszLibrary)
+{
+	if (!::PathFileExistsW(lpszLibrary)) {
+		return false;
+	}
+
+	HINSTANCE hDLL = LoadLibraryW(lpszLibrary);
+	if (hDLL == nullptr) {
+		if (::PathFileExistsW(lpszLibrary)) {
+			CString strParameters;
+			strParameters.Format(L" /s /u \"%s\"", lpszLibrary);
+			Execute(SystemPath() + L"regsvr32.exe" + strParameters);
+
+			return true;
+		}
+		return false;
+	}
+
+	auto pDllUnRegisterServer = (tpDllUnRegisterServer)GetProcAddress(hDLL, "DllUnregisterServer");
+	if (pDllUnRegisterServer == nullptr) {
+		FreeLibrary(hDLL);
+		return false;
+	}
+
+	HRESULT hr = pDllUnRegisterServer();
+
+	FreeLibrary(hDLL);
+
+	return SUCCEEDED(hr);
+}
+
+BOOL CPPageFormats::ShellExtExists()
+{
+	if (SysVersion::IsW64()) {
+		return ::PathFileExistsW(ShellExt64);
+	}
+
+	return ::PathFileExistsW(ShellExt);
+}
+
+static struct {
+	LPCSTR verb, cmd;
+	UINT action;
+} handlers[] = {
+	{"VideoFiles",	" %1",		IDS_AUTOPLAY_PLAYVIDEO},
+	{"MusicFiles",	" %1",		IDS_AUTOPLAY_PLAYMUSIC},
+	{"CDAudio",		" %1 /cd",	IDS_AUTOPLAY_PLAYAUDIOCD},
+	{"DVDMovie",	" %1 /dvd",	IDS_AUTOPLAY_PLAYDVDMOVIE},
+	{"BluRay",		" %1",		IDS_AUTOPLAY_PLAYBDMOVIE},
+};
+
+void CPPageFormats::AddAutoPlayToRegistry(autoplay_t ap, bool fRegister)
+{
+	CString exe = GetProgramPath();
+
+	unsigned i = (unsigned)ap;
+	if (i >= std::size(handlers)) {
+		return;
+	}
+
+	CRegKey key;
+
+	if (fRegister) {
+		if (ERROR_SUCCESS != key.Create(HKEY_CLASSES_ROOT, L"MPCBE.Autorun")) {
+			return;
+		}
+		key.Close();
+
+		if (ERROR_SUCCESS != key.Create(HKEY_CLASSES_ROOT,
+										CString(CStringA("MPCBE.Autorun\\Shell\\Play") + handlers[i].verb + "\\Command"))) {
+			return;
+		}
+		key.SetStringValue(nullptr, L"\"" + exe + L"\"" + handlers[i].cmd);
+		key.Close();
+
+		if (ERROR_SUCCESS != key.Create(HKEY_LOCAL_MACHINE,
+										CString(CStringA("SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Explorer\\AutoplayHandlers\\Handlers\\MPCBEPlay") + handlers[i].verb + "OnArrival"))) {
+			return;
+		}
+		key.SetStringValue(L"Action", ResStr(handlers[i].action));
+		key.SetStringValue(L"Provider", L"MPC-BE");
+		key.SetStringValue(L"InvokeProgID", L"MPCBE.Autorun");
+		key.SetStringValue(L"InvokeVerb", CString(CStringA("Play") + handlers[i].verb));
+		key.SetStringValue(L"DefaultIcon", exe + L",0");
+		key.Close();
+
+		if (ERROR_SUCCESS != key.Create(HKEY_LOCAL_MACHINE,
+										CString(CStringA("SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Explorer\\AutoplayHandlers\\EventHandlers\\Play") + handlers[i].verb + "OnArrival"))) {
+			return;
+		}
+		key.SetStringValue(CString(CStringA("MPCBEPlay") + handlers[i].verb + "OnArrival"), L"");
+	} else {
+		if (ERROR_SUCCESS != key.Create(HKEY_LOCAL_MACHINE,
+										CString(CStringA("SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Explorer\\AutoplayHandlers\\EventHandlers\\Play") + handlers[i].verb + "OnArrival"))) {
+			return;
+		}
+		key.DeleteValue(CString(CStringA("MPCBEPlay") + handlers[i].verb + "OnArrival"));
+	}
+}
+
+bool CPPageFormats::IsAutoPlayRegistered(autoplay_t ap)
+{
+	unsigned i = (unsigned)ap;
+	if (i >= std::size(handlers)) {
+		return false;
+	}
+
+	CRegKey key;
+
+	if (ERROR_SUCCESS != key.Open(HKEY_LOCAL_MACHINE,
+								  CString(CStringA("SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Explorer\\AutoplayHandlers\\EventHandlers\\Play") + handlers[i].verb + "OnArrival"),
+								  KEY_READ)) {
+		return false;
+	}
+
+	WCHAR buff[MAX_PATH] = {};
+	ULONG len = std::size(buff);
+
+	CString exe = GetProgramPath();
+
+	if (ERROR_SUCCESS != key.QueryStringValue(
+				CString(L"MPCBEPlay") + handlers[i].verb + L"OnArrival",
+				buff, &len)) {
+		return false;
+	}
+	key.Close();
+
+	if (ERROR_SUCCESS != key.Open(HKEY_CLASSES_ROOT,
+								  CString(CStringA("MPCBE.Autorun\\Shell\\Play") + handlers[i].verb + "\\Command"),
+								  KEY_READ)) {
+		return false;
+	}
+	len = std::size(buff);
+	if (ERROR_SUCCESS != key.QueryStringValue(nullptr, buff, &len)) {
+		return false;
+	}
+	if (_wcsnicmp(L"\"" + exe, buff, exe.GetLength() + 1)) {
+		return false;
+	}
+
+	return true;
+}
+
+void CPPageFormats::SetListItemState(int nItem)
+{
+	if (nItem < 0) {
+		return;
+	}
+
+	const CString str = AfxGetAppSettings().m_Formats[(int)m_list.GetItemData(nItem)].GetExtsWithPeriod();
+
+	std::list<CString> exts;
+	ExplodeMin(str, exts, ' ');
+
+	int cnt = 0;
+
+	for (const auto& ext : exts) {
+		if (IsRegistered(ext, true)) {
+			cnt++;
+		}
+	}
+
+	if (cnt != 0) {
+		cnt = (cnt == (int)exts.size() ? 1 : 2);
+	}
+
+	SetChecked(nItem, cnt);
+}
+
+BEGIN_MESSAGE_MAP(CPPageFormats, CPPageBase)
+	ON_NOTIFY(NM_CLICK, IDC_LIST1, OnNMClickList1)
+	ON_NOTIFY(LVN_ITEMCHANGED, IDC_LIST1, OnLvnItemchangedList1)
+	ON_NOTIFY(LVN_BEGINLABELEDITW, IDC_LIST1, OnBeginlabeleditList)
+	ON_NOTIFY(LVN_DOLABELEDIT, IDC_LIST1, OnDolabeleditList)
+	ON_NOTIFY(LVN_ENDLABELEDITW, IDC_LIST1, OnEndlabeleditList)
+	ON_BN_CLICKED(IDC_BUTTON1, OnBnClickedAll)
+	ON_BN_CLICKED(IDC_BUTTON2, OnBnClickedDefault)
+	ON_BN_CLICKED(IDC_BUTTON_EXT_SET, OnBnClickedSet)
+	ON_BN_CLICKED(IDC_BUTTON4, OnBnClickedVideo)
+	ON_BN_CLICKED(IDC_BUTTON3, OnBnClickedAudio)
+	ON_BN_CLICKED(IDC_BUTTON5, OnBnRunAdmin)
+	ON_BN_CLICKED(IDC_BUTTON6, OnBnClickedNone)
+	ON_BN_CLICKED(IDC_CHECK7, OnFilesAssocModified)
+	ON_BN_CLICKED(IDC_CHECK8, OnFilesAssocModified)
+	ON_UPDATE_COMMAND_UI(IDC_BUTTON2, OnUpdateButtonDefault)
+	ON_UPDATE_COMMAND_UI(IDC_BUTTON_EXT_SET, OnUpdateButtonSet)
+END_MESSAGE_MAP()
+
+// CPPageFormats message handlers
+
+void CPPageFormats::BuildCheckImageList()
+{
+	int chkH = 0;
+	if (CDPI* pDpi = dynamic_cast<CDPI*>(AfxGetMainWnd())) {
+		chkH = pDpi->ScaleY(12);
+	} else {
+		// this panel can be created without the main window.
+		CDPI dpi;
+		chkH = dpi.ScaleY(12);
+	}
+
+	m_onoff.DeleteImageList(); // rebuildable: re-run when the dark theme is toggled at runtime
+
+	if (DarkTheme::IsActive()) {
+		MakeDarkCheckImageList(m_onoff, chkH, m_list.GetSafeHwnd());
+	} else {
+		// Light theme: the SVG glyphs exactly as upstream draws them. (They were briefly replaced by
+		// the visual-style check box to match the other check lists, but the light look is not this
+		// change's to alter.)
+		CSvgImage svgImage;
+		if (svgImage.Load(IDF_SVG_ONOFF)) {
+			int w = 0;
+			int h = chkH;
+			if (HBITMAP hBitmap = svgImage.Rasterize(w, h)) {
+				if (w == h * 3) {
+					m_onoff.Create(h, h, ILC_COLOR32 | ILC_MASK, 3, 0);
+					ImageList_Add(m_onoff.GetSafeHandle(), hBitmap, nullptr);
+				}
+				DeleteObject(hBitmap);
+			}
+		}
+	}
+
+	m_list.SetImageList(&m_onoff, LVSIL_STATE);
+	m_onoffDark = DarkTheme::IsActive();
+}
+
+BOOL CPPageFormats::OnSetActive()
+{
+	const BOOL bRet = __super::OnSetActive();
+
+	// The checkbox glyphs are baked into an image list at init time; if the dark theme was
+	// toggled since then, rebuild them so unchecked boxes don't stay dark on a light dialog.
+	if (m_onoffDark != DarkTheme::IsActive()) {
+		BuildCheckImageList();
+		m_list.Invalidate();
+	}
+
+	return bRet;
+}
+
+BOOL CPPageFormats::OnInitDialog()
+{
+	__super::OnInitDialog();
+
+	SetCursor(m_hWnd, IDC_BUTTON1, IDC_HAND);
+
+	m_bFileExtChanged = false;
+
+	m_list.SetExtendedStyle(m_list.GetExtendedStyle() | LVS_EX_FULLROWSELECT);
+
+	m_list.InsertColumn(COL_CATEGORY, L"Category", LVCFMT_LEFT);
+
+	BuildCheckImageList();
+
+	CMediaFormats& mf = AfxGetAppSettings().m_Formats;
+	mf.UpdateData(false);
+	int i = 0;
+	for (const auto& mfc : mf) {
+		CString label;
+		label.Format (L"%s (%s)", mfc.GetDescription(), mfc.GetExts());
+
+		int iItem = m_list.InsertItem(i, label);
+		m_list.SetItemData(iItem, i);
+
+		i++;
+	}
+
+	m_list.SetColumnWidth(COL_CATEGORY, LVSCW_AUTOSIZE);
+	{
+		// Stretch the single column to at least the list width so the content (and the
+		// full-row selection highlight) fills the control instead of stopping mid-way.
+		CRect rcList;
+		m_list.GetClientRect(rcList);
+		if (m_list.GetColumnWidth(COL_CATEGORY) < rcList.Width()) {
+			m_list.SetColumnWidth(COL_CATEGORY, rcList.Width());
+		}
+	}
+
+	m_list.SetSelectionMark(0);
+	m_list.SetItemState(0, LVIS_SELECTED, LVIS_SELECTED);
+	m_exts = mf[(int)m_list.GetItemData(0)].GetExts();
+
+	CAppSettings& s = AfxGetAppSettings();
+
+	UpdateData(FALSE);
+
+	for (int i = 0; i < m_list.GetItemCount(); i++) {
+		SetListItemState(i);
+	}
+
+	m_chContextFiles.SetCheck(s.bSetContextFiles);
+	m_chContextDir.SetCheck(s.bSetContextDir);
+	m_chAssociatedWithIcons.SetCheck(s.bAssociatedWithIcons);
+
+	m_apvideo.SetCheck(IsAutoPlayRegistered(AP_VIDEO));
+	m_apmusic.SetCheck(IsAutoPlayRegistered(AP_MUSIC));
+	m_apaudiocd.SetCheck(IsAutoPlayRegistered(AP_AUDIOCD));
+	m_apdvd.SetCheck(IsAutoPlayRegistered(AP_DVDMOVIE));
+
+	CreateToolTip();
+
+	if (!IsUserAdmin()) {
+		GetDlgItem(IDC_BUTTON1)->ShowWindow(SW_HIDE);
+		GetDlgItem(IDC_BUTTON3)->ShowWindow(SW_HIDE);
+		GetDlgItem(IDC_BUTTON4)->ShowWindow(SW_HIDE);
+		GetDlgItem(IDC_BUTTON6)->ShowWindow(SW_HIDE);
+		GetDlgItem(IDC_CHECK1)->EnableWindow(FALSE);
+		GetDlgItem(IDC_CHECK2)->EnableWindow(FALSE);
+		GetDlgItem(IDC_CHECK3)->EnableWindow(FALSE);
+		GetDlgItem(IDC_CHECK4)->EnableWindow(FALSE);
+		GetDlgItem(IDC_CHECK6)->EnableWindow(FALSE);
+		GetDlgItem(IDC_CHECK7)->EnableWindow(FALSE);
+		GetDlgItem(IDC_CHECK8)->EnableWindow(FALSE);
+
+		GetDlgItem(IDC_BUTTON5)->ShowWindow(SW_SHOW);
+		GetDlgItem(IDC_BUTTON5)->SendMessageW(BCM_SETSHIELD, 0, 1);
+		DarkTheme::MarkUacShield(GetDlgItem(IDC_BUTTON5)->GetSafeHwnd());
+
+		m_bInsufficientPrivileges = true;
+	} else {
+		GetDlgItem(IDC_BUTTON5)->ShowWindow(SW_HIDE);
+	}
+
+	m_lUnRegisterExts.clear();
+
+	return TRUE;  // return TRUE unless you set the focus to a control
+	// EXCEPTION: OCX Property Pages should return FALSE
+}
+
+BOOL CPPageFormats::SetFileAssociation(CString strExt, CString strProgID, bool bRegister)
+{
+	CString extoldreg;
+	CRegKey key;
+	HRESULT hr = S_OK;
+	WCHAR   buff[MAX_PATH] = {};
+	ULONG   len = std::size(buff);
+
+	if (m_pAAR) {
+		// The Vista/7/8 way
+		CString strNewApp;
+		if (bRegister) {
+			// Create non existing file type
+			if (ERROR_SUCCESS != key.Create(HKEY_CLASSES_ROOT, strExt)) {
+				return false;
+			}
+
+			WCHAR* pszCurrentAssociation;
+			// Save current application associated
+			if (SUCCEEDED(m_pAAR->QueryCurrentDefault(strExt, AT_FILEEXTENSION, AL_EFFECTIVE, &pszCurrentAssociation))) {
+
+				if (ERROR_SUCCESS != key.Create(HKEY_CLASSES_ROOT, strProgID)) {
+					return false;
+				}
+
+				key.SetStringValue(previousRegistration, pszCurrentAssociation);
+
+				// Get current icon for file type
+				/*
+				if (ERROR_SUCCESS == key.Open(HKEY_CLASSES_ROOT, CString(pszCurrentAssociation) + L"\\DefaultIcon"))
+				{
+					len = std::size(buff);
+					if (ERROR_SUCCESS == key.QueryStringValue(nullptr, buff, &len) && !CString(buff).Trim().IsEmpty())
+					{
+						if (ERROR_SUCCESS == key.Create(HKEY_CLASSES_ROOT, strProgID + L"\\DefaultIcon"))
+							key.SetStringValue (nullptr, buff);
+					}
+				}
+				*/
+				CoTaskMemFree(pszCurrentAssociation);
+			}
+			strNewApp = registeredAppName;
+		} else {
+			if (ERROR_SUCCESS != key.Open(HKEY_CLASSES_ROOT, strProgID)) {
+				return false;
+			}
+
+			if (ERROR_SUCCESS == key.QueryStringValue(previousRegistration, buff, &len)) {
+				strNewApp = buff;
+			}
+
+			// TODO : retrieve registered app name from previous association (or find Bill function for that...)
+		}
+
+		hr = m_pAAR->SetAppAsDefault(strNewApp, strExt, AT_FILEEXTENSION);
+	} else {
+		// The 2000/XP/10 way
+		if (bRegister) {
+			// Set new association
+			if (ERROR_SUCCESS != key.Create(HKEY_CLASSES_ROOT, strExt)) {
+				return false;
+			}
+
+			if (ERROR_SUCCESS == key.QueryStringValue(nullptr, buff, &len) && !CString(buff).Trim().IsEmpty()) {
+				extoldreg = buff;
+			}
+			if (ERROR_SUCCESS != key.SetStringValue(nullptr, strProgID)) {
+				return false;
+			}
+
+			// Get current icon for file type
+			/*
+			if (!extoldreg.IsEmpty())
+			{
+				if (ERROR_SUCCESS == key.Open(HKEY_CLASSES_ROOT, extoldreg + L"\\DefaultIcon"))
+				{
+					len = std::size(buff);
+					if (ERROR_SUCCESS == key.QueryStringValue(nullptr, buff, &len) && !CString(buff).Trim().IsEmpty())
+						extOldIcon = buff;
+				}
+			}
+			*/
+
+			// Save old association
+			if (ERROR_SUCCESS != key.Create(HKEY_CLASSES_ROOT, strProgID)) {
+				return false;
+			}
+			key.SetStringValue(previousRegistration, extoldreg);
+
+			/*
+			if (!extOldIcon.IsEmpty() && (ERROR_SUCCESS == key.Create(HKEY_CLASSES_ROOT, strProgID + L"\\DefaultIcon")))
+				key.SetStringValue (nullptr, extOldIcon);
+			*/
+
+			if (SysVersion::IsWin10v1803orLater()) {
+				const auto keyName = L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Explorer\\FileExts\\" + strExt + L"\\UserChoice";
+				if (ERROR_SUCCESS == key.Open(HKEY_CURRENT_USER, keyName.GetString(), KEY_READ)) {
+					// generate UserChoice Hash
+					static auto sid = UserChoice::GetCurrentUserStringSid();
+					SYSTEMTIME systemTime = {};
+					GetSystemTime(&systemTime);
+
+					auto hash = UserChoice::GenerateUserChoiceHash(strExt.GetString(), sid.get(), strProgID.GetString(), systemTime);
+					if (hash &&
+							ERROR_SUCCESS == RegDeleteKeyW(HKEY_CURRENT_USER, keyName.GetString()) &&
+							ERROR_SUCCESS == key.Create(HKEY_CURRENT_USER, keyName.GetString())) {
+						key.SetStringValue(L"ProgId", strProgID.GetString());
+						key.SetStringValue(L"Hash", hash.get());
+					}
+				}
+			}
+		} else {
+			// Get previous association
+			if (ERROR_SUCCESS != key.Create(HKEY_CLASSES_ROOT, strProgID)) {
+				return false;
+			}
+			if (ERROR_SUCCESS == key.QueryStringValue(previousRegistration, buff, &len) && !CString(buff).Trim().IsEmpty()) {
+				extoldreg = buff;
+			}
+
+			// Set previous association
+			if (ERROR_SUCCESS != key.Create(HKEY_CLASSES_ROOT, strExt)) {
+				return false;
+			}
+			key.SetStringValue(nullptr, extoldreg);
+		}
+	}
+
+	return SUCCEEDED(hr);
+}
+
+void GetUnRegisterExts(CString saved_ext, CString new_ext, std::list<CString>& UnRegisterExts)
+{
+	if (saved_ext.CompareNoCase(new_ext) != 0) {
+		std::list<CString> saved_exts;
+		Explode(saved_ext, saved_exts, L' ');
+		std::list<CString> new_exts;
+		Explode(new_ext, new_exts, L' ');
+
+		for (const auto& ext : saved_exts) {
+			auto it = std::find_if(new_exts.cbegin(), new_exts.cend(), [&ext](const CString& item) {
+				return (item.CompareNoCase(ext) == 0);
+			});
+
+			if (it == new_exts.cend()) {
+				UnRegisterExts.emplace_back(L"." + ext);
+			}
+		}
+	}
+}
+
+BOOL CPPageFormats::OnApply()
+{
+	bool bSetAssociatedWithIconOld	= !!m_chAssociatedWithIcons.GetCheck();
+	bool bSetContextFileOld			= !!m_chContextFiles.GetCheck();
+
+	UpdateData();
+
+	CAppSettings& s = AfxGetAppSettings();
+	CMediaFormats& mf = s.m_Formats;
+
+	{
+		int i = m_list.GetSelectionMark();
+		if (i >= 0) {
+			i = (int)m_list.GetItemData(i);
+		}
+		if (i >= 0) {
+			GetUnRegisterExts(mf[i].GetExts(), m_exts, m_lUnRegisterExts);
+			mf[i].SetExts(m_exts);
+			m_exts = mf[i].GetExts();
+			UpdateData(FALSE);
+		}
+	}
+
+	for (const auto& ext : m_lUnRegisterExts) {
+		UnRegisterExt(ext);
+	}
+
+	RegisterApp();
+
+	bool bSetAssociatedWithIcon	= !!m_chAssociatedWithIcons.GetCheck();
+	bool bSetContextFile		= !!m_chContextFiles.GetCheck();
+
+	m_bFileExtChanged = m_bFileExtChanged || (bSetContextFileOld != bSetContextFile || bSetAssociatedWithIconOld != bSetAssociatedWithIcon);
+
+	if (m_bFileExtChanged) {
+		for (int i = 0; i < m_list.GetItemCount(); i++) {
+			int iChecked = GetChecked(i);
+
+			if (iChecked == 2) {
+				continue;
+			}
+
+			std::list<CString> exts;
+			Explode(mf[(int)m_list.GetItemData(i)].GetExtsWithPeriod(), exts, L' ');
+
+			for (const auto& ext : exts) {
+				if (iChecked) {
+					RegisterExt(ext, mf[(int)m_list.GetItemData(i)].GetDescription(), mf[i].GetFileType(), bSetContextFile, bSetAssociatedWithIcon);
+				} else {
+					UnRegisterExt(ext);
+				}
+			}
+		}
+	}
+
+	if ((m_bFileExtChanged
+			|| !!m_chContextFiles.GetCheck() != s.bSetContextFiles
+			|| !!m_chContextDir.GetCheck() != s.bSetContextDir) && ShellExtExists()) {
+		CRegKey key;
+		if (ERROR_SUCCESS == key.Create(HKEY_CURRENT_USER, shellExtKeyName)) {
+			key.SetStringValue(L"Play", ResStr(IDS_OPEN_WITH_MPC));
+			key.SetStringValue(L"Add", ResStr(IDS_ADD_TO_PLAYLIST));
+
+			key.SetDWORDValue(L"ShowFiles", !!m_chContextFiles.GetCheck());
+			key.SetDWORDValue(L"ShowDir", !!m_chContextDir.GetCheck());
+
+			key.SetDWORDValue(IDS_RS_MULTIINST, s.iMultipleInst);
+
+			key.Close();
+		}
+
+		if (ERROR_SUCCESS == key.Create(HKEY_LOCAL_MACHINE, shellExtKeyName)) {
+			key.SetStringValue(L"Play", ResStr(IDS_OPEN_WITH_MPC));
+			key.SetStringValue(L"Add", ResStr(IDS_ADD_TO_PLAYLIST));
+
+			key.SetDWORDValue(L"ShowFiles", !!m_chContextFiles.GetCheck());
+			key.SetDWORDValue(L"ShowDir", !!m_chContextDir.GetCheck());
+
+			key.SetDWORDValue(IDS_RS_MULTIINST, s.iMultipleInst);
+
+			key.Close();
+		}
+
+		const bool bIs64 = SysVersion::IsW64();
+		UnRegisterShellExt(ShellExt);
+		if (bIs64) {
+			UnRegisterShellExt(ShellExt64);
+		}
+
+		RegisterShellExt(ShellExt);
+		if (bIs64) {
+			RegisterShellExt(ShellExt64);
+		}
+	}
+
+	CRegKey key;
+	if (m_chContextDir.GetCheck() && !ShellExtExists()) {
+		if (ERROR_SUCCESS == key.Create(HKEY_CLASSES_ROOT, L"Directory\\shell\\" PROGID L".enqueue")) {
+			key.SetStringValue(nullptr, ResStr(IDS_ADD_TO_PLAYLIST));
+			key.SetStringValue(L"Icon", L"\"" + GetProgramPath() + L"\",0");
+		}
+
+		if (ERROR_SUCCESS == key.Create(HKEY_CLASSES_ROOT, L"Directory\\shell\\" PROGID L".enqueue\\command")) {
+			key.SetStringValue(nullptr, GetEnqueueCommand());
+		}
+
+		if (ERROR_SUCCESS == key.Create(HKEY_CLASSES_ROOT, L"Directory\\shell\\" PROGID L".play")) {
+			key.SetStringValue(nullptr, ResStr(IDS_OPEN_WITH_MPC));
+			key.SetStringValue(L"Icon", L"\"" + GetProgramPath() + L"\",0");
+		}
+
+		if (ERROR_SUCCESS == key.Create(HKEY_CLASSES_ROOT, L"Directory\\shell\\" PROGID L".play\\command")) {
+			key.SetStringValue(nullptr, GetOpenCommand());
+		}
+	} else {
+		key.Attach(HKEY_CLASSES_ROOT);
+		key.RecurseDeleteKey(L"Directory\\shell\\" PROGID L".enqueue");
+		key.RecurseDeleteKey(L"Directory\\shell\\" PROGID L".play");
+	}
+
+	SetListItemState(m_list.GetSelectionMark());
+
+	AddAutoPlayToRegistry(AP_VIDEO,		!!m_apvideo.GetCheck());
+	AddAutoPlayToRegistry(AP_MUSIC,		!!m_apmusic.GetCheck());
+	AddAutoPlayToRegistry(AP_AUDIOCD,	!!m_apaudiocd.GetCheck());
+	AddAutoPlayToRegistry(AP_DVDMOVIE,	!!m_apdvd.GetCheck());
+	AddAutoPlayToRegistry(AP_BDMOVIE,	!!m_apdvd.GetCheck());
+
+	s.bSetContextFiles		= !!m_chContextFiles.GetCheck();
+	s.bSetContextDir		= !!m_chContextDir.GetCheck();
+	s.bAssociatedWithIcons	= !!m_chAssociatedWithIcons.GetCheck();
+
+	if (m_bFileExtChanged) {
+		if (SysVersion::IsWin8orLater() && !SysVersion::IsWin11orLater()) {
+			RegisterUI();
+		}
+
+		SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_IDLIST, nullptr, nullptr);
+	}
+
+	m_bFileExtChanged = false;
+
+	m_lUnRegisterExts.clear();
+
+	return __super::OnApply();
+}
+
+void CPPageFormats::OnNMClickList1(NMHDR* pNMHDR, LRESULT* pResult)
+{
+	LPNMLISTVIEW lpnmlv = (LPNMLISTVIEW)pNMHDR;
+
+	if (lpnmlv->iItem >= 0 && lpnmlv->iSubItem == COL_CATEGORY) {
+		LVHITTESTINFO hti = {};
+		hti.pt = lpnmlv->ptAction;
+		m_list.HitTest(&hti);
+		if (hti.flags & LVHT_ONITEMSTATEICON) {
+			if (m_bInsufficientPrivileges) {
+				MessageBoxW(ResStr (IDS_CANNOT_CHANGE_FORMAT));
+			} else {
+				SetChecked(lpnmlv->iItem, (GetChecked(lpnmlv->iItem)&1) == 0 ? 1 : 0);
+				m_bFileExtChanged = true;
+				SetModified();
+			}
+		}
+	}
+
+	*pResult = 0;
+}
+
+void CPPageFormats::OnLvnItemchangedList1(NMHDR *pNMHDR, LRESULT *pResult)
+{
+	LPNMLISTVIEW pNMLV = reinterpret_cast<LPNMLISTVIEW>(pNMHDR);
+
+	if (pNMLV->iItem >= 0 && pNMLV->iSubItem == COL_CATEGORY
+			&& (pNMLV->uChanged&LVIF_STATE) && (pNMLV->uNewState&LVIS_SELECTED)) {
+		m_exts = AfxGetAppSettings().m_Formats[(int)m_list.GetItemData(pNMLV->iItem)].GetExts();
+		UpdateData(FALSE);
+	}
+
+	*pResult = 0;
+}
+
+void CPPageFormats::OnBeginlabeleditList(NMHDR* pNMHDR, LRESULT* pResult)
+{
+	NMLVDISPINFOW* pDispInfo = (NMLVDISPINFOW*)pNMHDR;
+	LVITEMW* pItem = &pDispInfo->item;
+
+	*pResult = FALSE;
+
+	if (pItem->iItem < 0) {
+		return;
+	}
+
+	//... process other columns
+}
+
+void CPPageFormats::OnDolabeleditList(NMHDR* pNMHDR, LRESULT* pResult)
+{
+	NMLVDISPINFOW* pDispInfo = (NMLVDISPINFOW*)pNMHDR;
+	LVITEMW* pItem = &pDispInfo->item;
+
+	*pResult = FALSE;
+
+	if (pItem->iItem < 0) {
+		return;
+	}
+
+	//... process other columns
+}
+
+void CPPageFormats::OnEndlabeleditList(NMHDR* pNMHDR, LRESULT* pResult)
+{
+	NMLVDISPINFOW* pDispInfo = (NMLVDISPINFOW*)pNMHDR;
+	LVITEMW* pItem = &pDispInfo->item;
+
+	*pResult = FALSE;
+
+	if (!m_list.m_fInPlaceDirty) {
+		return;
+	}
+
+	if (pItem->iItem < 0) {
+		return;
+	}
+
+	//... process other columns
+}
+
+void CPPageFormats::OnBnClickedAll()
+{
+	for (int i = 0, j = m_list.GetItemCount(); i < j; i++) {
+		SetChecked(i, 1);
+	}
+	m_bFileExtChanged = true;
+
+	SetModified();
+}
+
+void CPPageFormats::OnBnClickedVideo()
+{
+	const CMediaFormats& mf = AfxGetAppSettings().m_Formats;
+
+	for (int i = 0, j = m_list.GetItemCount(); i < j; i++) {
+		SetChecked(i, mf[(int)m_list.GetItemData(i)].GetFileType() == TVideo ? 1 : 0);
+	}
+	m_bFileExtChanged = true;
+
+	SetModified();
+}
+
+void CPPageFormats::OnBnClickedAudio()
+{
+	const CMediaFormats& mf = AfxGetAppSettings().m_Formats;
+
+	for (int i = 0, j = m_list.GetItemCount(); i < j; i++) {
+		SetChecked(i, mf[(int)m_list.GetItemData(i)].GetFileType() == TAudio ? 1 : 0);
+	}
+	m_bFileExtChanged = true;
+
+	SetModified();
+}
+
+void CPPageFormats::OnBnRunAdmin()
+{
+	CString strCmd;
+	strCmd.Format(L"/adminoption %d", IDD);
+
+	AfxGetMyApp()->RunAsAdministrator(GetProgramPath(), strCmd, true);
+
+	for (int i = 0; i < m_list.GetItemCount(); i++) {
+		SetListItemState(i);
+	}
+
+	CAppSettings& s = AfxGetAppSettings();
+	s.LoadFormats(false);
+
+	m_chContextFiles.SetCheck(s.bSetContextFiles);
+	m_chContextDir.SetCheck(s.bSetContextDir);
+	m_chAssociatedWithIcons.SetCheck(s.bAssociatedWithIcons);
+
+	m_apvideo.SetCheck(IsAutoPlayRegistered(AP_VIDEO));
+	m_apmusic.SetCheck(IsAutoPlayRegistered(AP_MUSIC));
+	m_apaudiocd.SetCheck(IsAutoPlayRegistered(AP_AUDIOCD));
+	m_apdvd.SetCheck(IsAutoPlayRegistered(AP_DVDMOVIE));
+}
+
+void CPPageFormats::OnBnClickedNone()
+{
+	for (int i = 0, j = m_list.GetItemCount(); i < j; i++) {
+		SetChecked(i, 0);
+	}
+	m_bFileExtChanged = true;
+
+	SetModified();
+}
+
+void CPPageFormats::OnBnClickedDefault()
+{
+	int iItem = m_list.GetSelectionMark();
+	if (iItem >= 0) {
+		DWORD_PTR i = m_list.GetItemData(iItem);
+		auto& mfc = AfxGetAppSettings().m_Formats[i];
+
+		mfc.RestoreDefaultExts();
+		GetUnRegisterExts(m_exts, mfc.GetExts(), m_lUnRegisterExts);
+		m_exts = mfc.GetExts();
+
+		CString label;
+		label.Format(L"%s (%s)", mfc.GetDescription(), mfc.GetExts());
+		m_list.SetItemText(iItem, COL_CATEGORY, label);
+		m_list.SetColumnWidth(COL_CATEGORY, LVSCW_AUTOSIZE);
+
+		//SetListItemState(m_list.GetSelectionMark());
+		UpdateData(FALSE);
+
+		m_bFileExtChanged = true;
+
+		SetModified();
+	}
+}
+
+void CPPageFormats::OnBnClickedSet()
+{
+	UpdateData();
+
+	int iItem = m_list.GetSelectionMark();
+	if (iItem >= 0) {
+		DWORD_PTR i = m_list.GetItemData(iItem);
+		auto& mfc = AfxGetAppSettings().m_Formats[i];
+
+		GetUnRegisterExts(mfc.GetExts(), m_exts, m_lUnRegisterExts);
+		mfc.SetExts(m_exts);
+		m_exts = mfc.GetExts();
+
+		CString label;
+		label.Format(L"%s (%s)", mfc.GetDescription(), mfc.GetExts());
+		m_list.SetItemText(iItem, COL_CATEGORY, label);
+		m_list.SetColumnWidth(COL_CATEGORY, LVSCW_AUTOSIZE);
+
+		//SetListItemState(m_list.GetSelectionMark());
+		UpdateData(FALSE);
+
+		m_bFileExtChanged = true;
+
+		SetModified();
+	}
+}
+
+void CPPageFormats::OnFilesAssocModified()
+{
+	m_bFileExtChanged = true;
+	SetModified();
+}
+
+void CPPageFormats::OnUpdateButtonDefault(CCmdUI* pCmdUI)
+{
+	int i = m_list.GetSelectionMark();
+	if (i < 0) {
+		pCmdUI->Enable(FALSE);
+		return;
+	}
+	i = (int)m_list.GetItemData(i);
+
+	CString orgexts, newexts;
+	GetDlgItem(IDC_EDIT1)->GetWindowTextW(newexts);
+	newexts.Trim();
+	orgexts = AfxGetAppSettings().m_Formats[i].GetBackupExts();
+
+	pCmdUI->Enable(!!newexts.CompareNoCase(orgexts));
+}
+
+void CPPageFormats::OnUpdateButtonSet(CCmdUI* pCmdUI)
+{
+	int i = m_list.GetSelectionMark();
+	if (i < 0) {
+		pCmdUI->Enable(FALSE);
+		return;
+	}
+	i = (int)m_list.GetItemData(i);
+
+	CString orgexts, newexts;
+	GetDlgItem(IDC_EDIT1)->GetWindowTextW(newexts);
+	newexts.Trim();
+	orgexts = AfxGetAppSettings().m_Formats[i].GetExts();
+
+	if (!!newexts.CompareNoCase(orgexts)) {
+		m_bFileExtChanged = true;
+	}
+
+	pCmdUI->Enable(!!newexts.CompareNoCase(orgexts));
+}

@@ -1,0 +1,199 @@
+/*
+ * (C) 2003-2006 Gabest
+ * (C) 2006-2023 see Authors.txt
+ *
+ * This file is part of MPC-BE.
+ *
+ * MPC-BE is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation; either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * MPC-BE is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ */
+
+#include "stdafx.h"
+#include "MainFrm.h"
+#include "PPageBase.h"
+#include "controls/DarkTheme.h"
+
+// CPPageBase dialog
+
+IMPLEMENT_DYNAMIC(CPPageBase, CCmdUIPropertyPage)
+CPPageBase::CPPageBase(UINT nIDTemplate, UINT nIDCaption)
+	: CCmdUIPropertyPage(nIDTemplate, nIDCaption)
+{
+}
+
+CPPageBase::~CPPageBase()
+{
+}
+
+void CPPageBase::DoDataExchange(CDataExchange* pDX)
+{
+	__super::DoDataExchange(pDX);
+}
+
+void CPPageBase::CreateToolTip()
+{
+	m_wndToolTip.Create(this);
+	m_wndToolTip.Activate(TRUE);
+	m_wndToolTip.SetMaxTipWidth(350);
+	m_wndToolTip.SetDelayTime(TTDT_AUTOPOP, 10000);
+
+	for (CWnd* pChild = GetWindow(GW_CHILD); pChild; pChild = pChild->GetWindow(GW_HWNDNEXT)) {
+		CString strToolTip;
+
+		if (strToolTip.LoadString(pChild->GetDlgCtrlID())) {
+			m_wndToolTip.AddTool(pChild, strToolTip);
+		}
+	}
+}
+
+BOOL CPPageBase::PreTranslateMessage(MSG* pMsg)
+{
+	if (IsWindow(m_wndToolTip))
+		if (pMsg->message >= WM_MOUSEFIRST && pMsg->message <= WM_MOUSELAST) {
+			MSG msg;
+			memcpy(&msg, pMsg, sizeof(MSG));
+
+			for (HWND hWndParent = ::GetParent(msg.hwnd);
+					hWndParent && hWndParent != m_hWnd;
+					hWndParent = ::GetParent(hWndParent)) {
+				msg.hwnd = hWndParent;
+			}
+
+			if (msg.hwnd) {
+				m_wndToolTip.RelayEvent(&msg);
+			}
+		}
+
+	return __super::PreTranslateMessage(pMsg);
+}
+
+BEGIN_MESSAGE_MAP(CPPageBase, CCmdUIPropertyPage)
+	ON_WM_DESTROY()
+	ON_WM_CTLCOLOR()
+	ON_WM_ERASEBKGND()
+END_MESSAGE_MAP()
+
+// CPPageBase message handlers
+
+BOOL CPPageBase::OnInitDialog()
+{
+	BOOL bRet = __super::OnInitDialog();
+
+	// Theme the controls here, before the page fills them in and measures them. A list view that has
+	// been given the dark style leaves more room around the text of a cell than the default style
+	// does, so a column measured with LVSCW_AUTOSIZE before the style was applied comes out a few
+	// pixels short and cuts the text - "Wheel Do...", "100.5..." at 200% (#1299). Doing this on the
+	// first activation, as it used to, is too late: the page measured in its own OnInitDialog.
+	DarkTheme::ClipDialogChildren(GetSafeHwnd());
+	DarkTheme::ApplyThemeToChildren(GetSafeHwnd());
+	// Deliberately NOT marking the page as themed here: pages build on top of this. The Keys page
+	// creates its list from scratch over a placeholder, and others re-add LVS_EX_GRIDLINES, both
+	// after this runs - so OnSetActive themes once more when the page is finished, which is what
+	// used to be the only pass.
+
+	return bRet;
+}
+
+BOOL CPPageBase::OnSetActive()
+{
+	AfxGetAppSettings().nLastUsedPage = (UINT)(ULONG_PTR)m_pPSP->pszTemplate;
+
+	BOOL bRet = __super::OnSetActive();
+
+	// Apply the dark visual style once, on first activation. Re-theming on every activation
+	// (SetWindowTheme per control + repaint) made switching pages sluggish; the controls stay
+	// themed for the page's lifetime, so once is enough.
+	if (!m_bDarkThemeApplied) {
+		DarkTheme::ClipDialogChildren(GetSafeHwnd());
+		DarkTheme::ApplyThemeToChildren(GetSafeHwnd());
+		m_bDarkThemeApplied = true;
+	}
+	// Keep group boxes behind the controls they frame so their dark fill never paints over them.
+	// Cheap (no SetWindowTheme), runs every activation so it self-heals after a runtime toggle.
+	DarkTheme::FixGroupBoxes(GetSafeHwnd());
+
+	return bRet;
+}
+
+HBRUSH CPPageBase::OnCtlColor(CDC* pDC, CWnd* pWnd, UINT nCtlColor)
+{
+	HBRUSH hbr = __super::OnCtlColor(pDC, pWnd, nCtlColor);
+
+	if (HBRUSH hbrDark = DarkTheme::OnCtlColor(pDC, nCtlColor)) {
+		return hbrDark;
+	}
+
+	return hbr;
+}
+
+BOOL CPPageBase::OnEraseBkgnd(CDC* pDC)
+{
+	if (DarkTheme::IsActive()) {
+		CRect rc;
+		GetClientRect(rc);
+		pDC->FillSolidRect(rc, DarkTheme::FaceColor());
+		// Localized resources use SS_ETCHED* dividers, which paint a light 3D line dark mode never darkens.
+		// They are hidden while theming, so draw them here, on top of the background we just filled.
+		DarkTheme::DrawHiddenSeparators(GetSafeHwnd(), pDC);
+		return TRUE;
+	}
+
+	return __super::OnEraseBkgnd(pDC);
+}
+
+BOOL CPPageBase::OnNotify(WPARAM wParam, LPARAM lParam, LRESULT* pResult)
+{
+	// For NM_CUSTOMDRAW, let any page-specific handler run first (e.g. colour-picker
+	// buttons that paint themselves with the selected colour, or list controls). Only
+	// when the page does not handle it do we apply the generic dark theming for the
+	// controls native dark mode leaves light: trackbar (slider) channels, checkbox/
+	// radio-button captions and push buttons. (Group boxes are handled by subclassing,
+	// since they emit no NM_CUSTOMDRAW.)
+	NMHDR* pNMHDR = reinterpret_cast<NMHDR*>(lParam);
+	if (pNMHDR && pNMHDR->code == NM_CUSTOMDRAW) {
+		if (__super::OnNotify(wParam, lParam, pResult)) {
+			return TRUE;
+		}
+		if (DarkTheme::TrackbarCustomDraw(pNMHDR, pResult)) {
+			return TRUE;
+		}
+		if (DarkTheme::ButtonCustomDraw(pNMHDR, pResult)) {
+			return TRUE;
+		}
+		return FALSE;
+	}
+
+	return __super::OnNotify(wParam, lParam, pResult);
+}
+
+void CPPageBase::OnDestroy()
+{
+	__super::OnDestroy();
+
+	m_wndToolTip.DestroyWindow();
+}
+
+BOOL CPPageBase::OnApply()
+{
+	if (auto pMainFrame = AfxFindMainFrame()) { // need dynamic_cast, because CPPageFormats can be run in a separate process without CMainFrame.
+		pMainFrame->PostMessageW(WM_SAVESETTINGS);
+	}
+
+	return __super::OnApply();
+}
+
+int CPPageBase::ScaleY(int y)
+{
+	return AfxGetMainFrame()->ScaleY(y);
+}
